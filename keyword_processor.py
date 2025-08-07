@@ -1,7 +1,8 @@
 import pandas as pd
 import time
+import json
 from typing import List
-from pydantic import BaseModel, Field, RootModel
+from pydantic import BaseModel, RootModel
 from langchain.schema import HumanMessage
 from langchain.output_parsers import PydanticOutputParser
 from langchain_openai import ChatOpenAI
@@ -30,10 +31,14 @@ class KeywordBatch(RootModel[List[KeywordClassification]]):
 
 class KeywordProcessor:
     def __init__(self):
+        self.brand_name = None
         self.client = ChatOpenAI(
             model=OPENAI_MODEL, temperature=TEMPERATURE, api_key=OPENAI_API_KEY
         )
         self.parser = PydanticOutputParser(pydantic_object=KeywordBatch)
+
+    def set_brand_name(self, brand_name: str):
+        self.brand_name = brand_name.strip().lower()
 
     def call_llm(self, prompt: str) -> List[dict]:
         retries = 0
@@ -51,9 +56,8 @@ class KeywordProcessor:
         return []
 
     def process_batch(self, batch_keywords: List[str]) -> List[dict]:
-        initial_results = self.call_llm(
-            get_initial_classification_prompt(batch_keywords)
-        )
+        prompt = get_initial_classification_prompt(batch_keywords, self.brand_name)
+        initial_results = self.call_llm(prompt)
         if not initial_results:
             return []
 
@@ -66,16 +70,50 @@ class KeywordProcessor:
             or refined_intents
         )
 
-        # Final enforcement of allowed values
         for entry in final_results:
             if entry["Question"] not in ["Question", "Not Question"]:
                 entry["Question"] = "Not Question"
             if entry["Location"] not in ["Location", "No Location"]:
                 entry["Location"] = "No Location"
-            if not entry["Properties"].strip():
-                entry["Properties"] = ""  # Ensure empty if no property
+            if not entry.get("Properties") or len(entry["Properties"].strip()) == 0:
+                entry["Properties"] = ""
 
         return final_results
+
+    def normalize_categories_with_llm(self, df: pd.DataFrame) -> pd.DataFrame:
+        unique_categories = sorted(df["Category"].dropna().unique().tolist())
+        if not unique_categories:
+            return df 
+
+        prompt = f"""
+You are helping standardize keyword categories for ad grouping.
+
+Here is a list of raw category labels:
+{unique_categories}
+
+Please group similar ones together and assign a single clean, consistent name to each group.
+
+Return output as a strict JSON object like this:
+{{"Old Category A": "Standard Group 1", "Old Category B": "Standard Group 1", "Old Category C": "Standard Group 2"}}
+
+⚠️ Rules:
+- Use proper JSON syntax — keys and values must be in double quotes.
+- Return only the JSON object, with no extra commentary or explanation.
+- Be concise and consistent.
+- Do not create new category names — just standardize the ones provided.
+"""
+
+        try:
+            response = self.client.invoke([HumanMessage(content=prompt)])
+            raw_json = response.content.strip()
+
+            mapping = json.loads(raw_json)
+            df["Category"] = df["Category"].map(mapping).fillna(df["Category"])
+            return df
+
+        except Exception as e:
+            print("⚠️ Failed to normalize categories:", e)
+            return df
 
     def process_keywords(self, df: pd.DataFrame) -> pd.DataFrame:
         keywords = df["Keyword"].dropna().tolist()
@@ -91,6 +129,10 @@ class KeywordProcessor:
             all_results.extend(results)
 
         results_df = pd.DataFrame(all_results)
+
+        # Normalize categories dynamically using LLM (safe with json)
+        results_df = self.normalize_categories_with_llm(results_df)
+
         merged_df = pd.concat(
             [df.reset_index(drop=True), results_df.reset_index(drop=True)], axis=1
         )
