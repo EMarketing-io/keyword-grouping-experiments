@@ -13,19 +13,17 @@ from prompts import (
 from config import OPENAI_MODEL, BATCH_SIZE, TEMPERATURE, MAX_RETRIES, OPENAI_API_KEY
 
 
-# Schema for one keyword classification
 class KeywordClassification(BaseModel):
-    Question: str = Field(description="Yes or No")
-    Location: str = Field(description="Yes or No, with location if Yes")
-    Type: str = Field(description="Brand, Competitor, or Generic")
-    Product_Service: str = Field(description="Product, Service, Brand, or Other")
-    Category: str = Field(description="Standardized category")
-    Properties: str = Field(description="Single best property from the keyword")
-    Intent: str = Field(description="User's likely search intent")
-    Intent_Description: str = Field(description="Explanation of the intent")
+    Question: str
+    Location: str
+    Type: str
+    Product_Service: str
+    Category: str
+    Properties: str
+    Intent: str
+    Intent_Description: str
 
 
-# Schema for a batch of keyword classifications (Pydantic v2 RootModel)
 class KeywordBatch(RootModel[List[KeywordClassification]]):
     pass
 
@@ -58,18 +56,32 @@ class KeywordProcessor:
         )
         if not initial_results:
             return []
-        refined_intents = self.call_llm(get_intent_refinement_prompt(initial_results))
-        if not refined_intents:
-            refined_intents = initial_results
-        final_results = self.call_llm(get_consistency_review_prompt(refined_intents))
-        if not final_results:
-            final_results = refined_intents
+
+        refined_intents = (
+            self.call_llm(get_intent_refinement_prompt(initial_results))
+            or initial_results
+        )
+        final_results = (
+            self.call_llm(get_consistency_review_prompt(refined_intents))
+            or refined_intents
+        )
+
+        # Final enforcement of allowed values
+        for entry in final_results:
+            if entry["Question"] not in ["Question", "Not Question"]:
+                entry["Question"] = "Not Question"
+            if entry["Location"] not in ["Location", "No Location"]:
+                entry["Location"] = "No Location"
+            if not entry["Properties"].strip():
+                entry["Properties"] = ""  # Ensure empty if no property
+
         return final_results
 
     def process_keywords(self, df: pd.DataFrame) -> pd.DataFrame:
         keywords = df["Keyword"].dropna().tolist()
         all_results = []
         total_batches = (len(keywords) - 1) // BATCH_SIZE + 1
+
         for i in range(0, len(keywords), BATCH_SIZE):
             batch = keywords[i : i + BATCH_SIZE]
             print(
